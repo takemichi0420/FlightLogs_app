@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color: #10212f;
+  background:
+    radial-gradient(circle at top right, rgba(15, 142, 199, 0.18), transparent 28%),
+    linear-gradient(180deg, #edf5f8 0%, #f8fbfd 55%, #eaf2f6 100%);
+  font-family: "Noto Sans JP", "BIZ UDPGothic", sans-serif;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+@layer components {
+  .panel {
+    @apply rounded-[28px] border border-slate-200/80 bg-white/85 shadow-panel backdrop-blur;
+  }
+
+  .panel-muted {
+    @apply rounded-[22px] border border-slate-200 bg-slate-50/90;
+  }
+
+  .input {
+    @apply w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-800 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-200;
+  }
+
+  .label {
+    @apply mb-2 block text-sm font-semibold text-slate-700;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-2xl bg-ink px-4 py-3 text-sm font-semibold text-white transition hover:bg-sea disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:border-sky-400 hover:text-sky-700;
+  }
+}

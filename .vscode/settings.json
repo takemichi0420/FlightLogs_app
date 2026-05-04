@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "/home/ardupilot/GitHub/workshop/FightLog_app_project/venv/bin/python",
+  "python.analysis.extraPaths": [
+    "/home/ardupilot/GitHub/workshop/FightLog_app_project/backend"
+  ],
+  "python.analysis.typeCheckingMode": "basic",
+  "python.envFile": "/home/ardupilot/GitHub/workshop/FightLog_app_project/.env"
+}
