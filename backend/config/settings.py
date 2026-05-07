@@ -11,16 +11,26 @@ load_dotenv(BASE_DIR.parent / ".env")
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-secret-key")
 DEBUG = os.getenv("DJANGO_DEBUG", "1") == "1"
 ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",") if host.strip()]
-CORS_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("DJANGO_CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
-    if origin.strip()
+
+
+def _csv_setting(name: str, default: str = "") -> list[str]:
+    return [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+
+
+def _append_unique(values: list[str], additions: list[str]) -> list[str]:
+    return list(dict.fromkeys([*values, *additions]))
+
+
+DEV_FRONTEND_ORIGINS = [
+    origin
+    for port in range(5173, 5180)
+    for origin in (f"http://localhost:{port}", f"http://127.0.0.1:{port}")
 ]
-CSRF_TRUSTED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
-    if origin.strip()
-]
+CORS_ALLOWED_ORIGINS = _csv_setting("DJANGO_CORS_ALLOWED_ORIGINS", ",".join(DEV_FRONTEND_ORIGINS))
+CSRF_TRUSTED_ORIGINS = _csv_setting("DJANGO_CSRF_TRUSTED_ORIGINS", ",".join(DEV_FRONTEND_ORIGINS))
+if DEBUG:
+    CORS_ALLOWED_ORIGINS = _append_unique(CORS_ALLOWED_ORIGINS, DEV_FRONTEND_ORIGINS)
+    CSRF_TRUSTED_ORIGINS = _append_unique(CSRF_TRUSTED_ORIGINS, DEV_FRONTEND_ORIGINS)
 CORS_ALLOW_CREDENTIALS = True
 
 

@@ -48,7 +48,7 @@ class FlightAnalysisSerializer(serializers.ModelSerializer):
 
 
 class AnalysisJobSerializer(serializers.ModelSerializer):
-    flight_record_id = serializers.IntegerField(source="flight_record_id", read_only=True)
+    flight_record_id = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = AnalysisJob

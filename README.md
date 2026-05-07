@@ -1,6 +1,6 @@
 # ArduPilot Flight Record App
 
-ArduPilot ログから飛行記録ドラフトを作成し、正式値の入力、確定、PDF出力まで行う Django + React の MVP です。
+ArduPilot ログから飛行記録ドラフトを作成し、正式値の入力、確定、PDF出力まで行う Django + React の MVP(Minimum Viable Product)です。
 
 ## 構成
 
@@ -18,7 +18,7 @@ ArduPilot ログから飛行記録ドラフトを作成し、正式値の入力�
 この環境では `ensurepip` がないため、仮想環境は `--without-pip` で作成し、外側の `pip` から注入しています。
 
 ```bash
-cd /home/ardupilot/GitHub/workshop/FightLog_app_project
+cd /home/ardupilot/GitHub/workshop/FlightLog_app_project
 python3 -m venv --without-pip venv
 python3 -m pip --python venv/bin/python install --upgrade pip setuptools wheel
 python3 -m pip --python venv/bin/python install -r backend/requirements.txt
@@ -27,7 +27,7 @@ python3 -m pip --python venv/bin/python install -r backend/requirements.txt
 ### 2. Node modules
 
 ```bash
-cd /home/ardupilot/GitHub/workshop/FightLog_app_project/frontend
+cd /home/ardupilot/GitHub/workshop/FlightLog_app_project/frontend
 npm install
 ```
 
@@ -36,7 +36,7 @@ npm install
 ### Backend
 
 ```bash
-cd /home/ardupilot/GitHub/workshop/FightLog_app_project/backend
+cd /home/ardupilot/GitHub/workshop/FlightLog_app_project/backend
 ../venv/bin/python manage.py migrate
 ../venv/bin/python manage.py runserver
 ```
@@ -44,7 +44,7 @@ cd /home/ardupilot/GitHub/workshop/FightLog_app_project/backend
 ### Frontend
 
 ```bash
-cd /home/ardupilot/GitHub/workshop/FightLog_app_project/frontend
+cd /home/ardupilot/GitHub/workshop/FlightLog_app_project/frontend
 npm run dev
 ```
 
@@ -92,12 +92,12 @@ npm run dev
 ## 検証コマンド
 
 ```bash
-cd /home/ardupilot/GitHub/workshop/FightLog_app_project/backend
+cd /home/ardupilot/GitHub/workshop/FlightLog_app_project/backend
 ../venv/bin/python manage.py check
 ../venv/bin/python manage.py test
 ../venv/bin/ruff check .
 
-cd /home/ardupilot/GitHub/workshop/FightLog_app_project/frontend
+cd /home/ardupilot/GitHub/workshop/FlightLog_app_project/frontend
 npm run build
 ```
 

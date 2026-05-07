@@ -46,6 +46,29 @@ export type MavlinkLogEntry = {
   last_log_num: number;
 };
 
+export type AltitudeProfilePoint = {
+  time_s: number;
+  altitude_m: number;
+  relative_altitude_m: number;
+  speed_mps: number | null;
+  x_m: number;
+  y_m: number;
+  lat?: number;
+  lng?: number;
+};
+
+export type WaypointPoint = {
+  seq: number;
+  command: number | null;
+  frame: number | null;
+  lat: number;
+  lng: number;
+  altitude_m: number;
+  relative_altitude_m: number;
+  x_m: number;
+  y_m: number;
+};
+
 export type FlightAnalysis = {
   arm_at_utc: string | null;
   disarm_at_utc: string | null;
@@ -59,6 +82,13 @@ export type FlightAnalysis = {
   gps_max_hdop: number | null;
   warning_messages: string[];
   error_messages: string[];
+  summary_json: {
+    altitude_profile?: AltitudeProfilePoint[];
+    altitude_profile_count?: number;
+    waypoints?: WaypointPoint[];
+    waypoint_count?: number;
+    [key: string]: unknown;
+  };
 };
 
 export type FlightModeSpan = {

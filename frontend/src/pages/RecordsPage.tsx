@@ -49,7 +49,7 @@ export function RecordsPage() {
   const [pilotId, setPilotId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [pollingJobId, setPollingJobId] = useState<string | null>(null);
-  const [mavlinkConnection, setMavlinkConnection] = useState("udp:127.0.0.1:14550");
+  const [mavlinkConnection, setMavlinkConnection] = useState("udpin:0.0.0.0:14550");
   const [mavlinkBaud, setMavlinkBaud] = useState("115200");
   const [mavlinkAircraftId, setMavlinkAircraftId] = useState("");
   const [mavlinkPilotId, setMavlinkPilotId] = useState("");
@@ -144,6 +144,7 @@ export function RecordsPage() {
     setMavlinkImporting(true);
     setMavlinkError("");
     setMavlinkMessage("");
+    let imported = false;
     try {
       const payload: Record<string, string | number> = {
         connection: mavlinkConnection,
@@ -154,13 +155,24 @@ export function RecordsPage() {
       if (mavlinkPilotId) payload.pilot_id = Number(mavlinkPilotId);
 
       const response = await api.post<AnalysisJob>("/mavlink/import-log/", payload);
+      imported = true;
       setPollingJobId(response.data.id);
       setMavlinkMessage("MAVLinkログを取り込み、解析ジョブを開始しました。");
-      await load();
     } catch (error) {
       setMavlinkError(getErrorMessage(error, "MAVLinkログの取り込みに失敗しました。"));
+      return;
     } finally {
       setMavlinkImporting(false);
+    }
+
+    if (!imported) {
+      return;
+    }
+
+    try {
+      await load();
+    } catch (error) {
+      setMavlinkError(getErrorMessage(error, "取り込みは完了しましたが、一覧の更新に失敗しました。画面を再読み込みしてください。"));
     }
   }
 
@@ -240,7 +252,7 @@ export function RecordsPage() {
           ) : null}
           <div className="md:col-span-2">
             <button className="btn-primary w-full" disabled={!mavlinkConnection || mavlinkLoading || mavlinkImporting} onClick={() => void importMavlinkLog()} type="button">
-              {mavlinkImporting ? "取り込み中..." : mavlinkLogId ? "選択ログを取り込んで解析" : "最新ログを取り込んで解析"}
+              {mavlinkImporting ? "ログをダウンロード中..." : mavlinkLogId ? "選択ログを取り込んで解析" : "最新ログを取り込んで解析"}
             </button>
           </div>
           {mavlinkMessage ? <p className="text-sm text-slate-600 md:col-span-2">{mavlinkMessage}</p> : null}

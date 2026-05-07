@@ -21,11 +21,274 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Flowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from .models import FlightAnalysis, FlightModeSpan, FlightRecord, FlightTimeLedger, GeneratedAsset
 
 logger = logging.getLogger(__name__)
+
+
+def _to_float(value: Any) -> float | None:
+    if value in ("", None):
+        return None
+    try:
+        converted = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(converted):
+        return None
+    return converted
+
+
+def _format_meters(value: Any) -> str:
+    converted = _to_float(value)
+    if converted is None:
+        return "-"
+    rounded = round(converted, 1)
+    if rounded.is_integer():
+        return f"{rounded:.0f}m"
+    return f"{rounded:.1f}m"
+
+
+class AltitudeProfile3DChart(Flowable):
+    def __init__(self, profile: list[dict[str, Any]], waypoints: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.profile = self._clean_profile(profile)
+        self.waypoints = self._clean_waypoints(waypoints)
+        self.width = 0
+        self.height = 82 * mm
+
+    @staticmethod
+    def _clean_profile(profile: list[dict[str, Any]]) -> list[dict[str, float]]:
+        points: list[dict[str, float]] = []
+        for item in profile:
+            x_m = _to_float(item.get("x_m"))
+            y_m = _to_float(item.get("y_m"))
+            altitude_m = _to_float(item.get("relative_altitude_m"))
+            if x_m is None or y_m is None or altitude_m is None:
+                continue
+            points.append({"x_m": x_m, "y_m": y_m, "relative_altitude_m": max(altitude_m, 0.0)})
+        return points
+
+    @staticmethod
+    def _clean_waypoints(waypoints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        points: list[dict[str, Any]] = []
+        for item in waypoints:
+            x_m = _to_float(item.get("x_m"))
+            y_m = _to_float(item.get("y_m"))
+            relative_altitude_m = _to_float(item.get("relative_altitude_m"))
+            if x_m is None or y_m is None or relative_altitude_m is None:
+                continue
+            points.append(
+                {
+                    "seq": item.get("seq"),
+                    "x_m": x_m,
+                    "y_m": y_m,
+                    "relative_altitude_m": max(relative_altitude_m, 0.0),
+                    "altitude_m": item.get("altitude_m"),
+                }
+            )
+        return points
+
+    @property
+    def has_data(self) -> bool:
+        return len(self.profile) >= 2
+
+    def wrap(self, avail_width: float, avail_height: float) -> tuple[float, float]:
+        del avail_height
+        self.width = min(avail_width, 178 * mm)
+        return self.width, self.height
+
+    def _projector(self, left: float, bottom: float, area_width: float, area_height: float):
+        def raw_project(x: float, y: float, z: float) -> tuple[float, float]:
+            return x + 0.62 * y, 1.34 * z + 0.38 * y
+
+        corners = [
+            raw_project(x, y, z)
+            for x in (-1.0, 1.0)
+            for y in (-1.0, 1.0)
+            for z in (0.0, 1.0)
+        ]
+        min_x = min(point[0] for point in corners)
+        max_x = max(point[0] for point in corners)
+        min_y = min(point[1] for point in corners)
+        max_y = max(point[1] for point in corners)
+        raw_width = max_x - min_x
+        raw_height = max_y - min_y
+        scale = min(area_width / raw_width, area_height / raw_height)
+        offset_x = left + (area_width - raw_width * scale) / 2 - min_x * scale
+        offset_y = bottom + (area_height - raw_height * scale) / 2 - min_y * scale
+
+        def project(x: float, y: float, z: float) -> tuple[float, float]:
+            raw_x, raw_y = raw_project(x, y, z)
+            return offset_x + raw_x * scale, offset_y + raw_y * scale
+
+        return project
+
+    def _normalizers(self):
+        points = [*self.profile, *self.waypoints]
+        x_values = [point["x_m"] for point in points]
+        y_values = [point["y_m"] for point in points]
+        altitude_values = [point["relative_altitude_m"] for point in points]
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(y_values), max(y_values)
+        x_center = (x_min + x_max) / 2
+        y_center = (y_min + y_max) / 2
+        horizontal_span = max(x_max - x_min, y_max - y_min, 1.0)
+        altitude_span = max(max(altitude_values), 1.0)
+
+        def normalize(point: dict[str, Any], ground: bool = False) -> tuple[float, float, float]:
+            x = ((point["x_m"] - x_center) / horizontal_span) * 2
+            y = ((point["y_m"] - y_center) / horizontal_span) * 2
+            z = 0.0 if ground else min(max(point["relative_altitude_m"] / altitude_span, 0.0), 1.0)
+            return x, y, z
+
+        return normalize
+
+    def draw(self) -> None:
+        canvas = self.canv
+        canvas.saveState()
+        try:
+            self._draw_chart(canvas)
+        finally:
+            canvas.restoreState()
+
+    def _draw_chart(self, canvas) -> None:
+        canvas.setFillColor(colors.HexColor("#f8fbfd"))
+        canvas.setStrokeColor(colors.HexColor("#d7e3ec"))
+        canvas.roundRect(0, 0, self.width, self.height, 8, fill=1, stroke=1)
+
+        canvas.setFont("HeiseiKakuGo-W5", 11)
+        canvas.setFillColor(colors.HexColor("#0f2535"))
+        canvas.drawString(8 * mm, self.height - 10 * mm, "3D高度プロファイル")
+        canvas.setFont("HeiseiKakuGo-W5", 7.5)
+        canvas.setFillColor(colors.HexColor("#587084"))
+        canvas.drawString(8 * mm, self.height - 15 * mm, "Z=高度 / X・Y=水平位置 / 橙=waypoint")
+
+        if not self.has_data:
+            canvas.setFont("HeiseiKakuGo-W5", 9)
+            canvas.setFillColor(colors.HexColor("#64748b"))
+            canvas.drawCentredString(self.width / 2, self.height / 2, "高度時系列データがありません。")
+            return
+
+        left = 8 * mm
+        bottom = 8 * mm
+        area_width = self.width - 16 * mm
+        area_height = self.height - 28 * mm
+        project = self._projector(left, bottom, area_width, area_height)
+        normalize = self._normalizers()
+
+        def projected(point: dict[str, Any], ground: bool = False) -> tuple[float, float]:
+            return project(*normalize(point, ground=ground))
+
+        def draw_line(points: list[tuple[float, float]], color: colors.Color, width: float) -> None:
+            if len(points) < 2:
+                return
+            canvas.setStrokeColor(color)
+            canvas.setLineWidth(width)
+            path = canvas.beginPath()
+            path.moveTo(points[0][0], points[0][1])
+            for x, y in points[1:]:
+                path.lineTo(x, y)
+            canvas.drawPath(path, stroke=1, fill=0)
+
+        box_edges = [
+            ((-1, -1, 0), (1, -1, 0)),
+            ((1, -1, 0), (1, 1, 0)),
+            ((1, 1, 0), (-1, 1, 0)),
+            ((-1, 1, 0), (-1, -1, 0)),
+            ((-1, -1, 1), (1, -1, 1)),
+            ((1, -1, 1), (1, 1, 1)),
+            ((1, 1, 1), (-1, 1, 1)),
+            ((-1, 1, 1), (-1, -1, 1)),
+            ((-1, -1, 0), (-1, -1, 1)),
+            ((1, -1, 0), (1, -1, 1)),
+            ((1, 1, 0), (1, 1, 1)),
+            ((-1, 1, 0), (-1, 1, 1)),
+        ]
+        canvas.setStrokeColor(colors.HexColor("#cbd5df"))
+        canvas.setLineWidth(0.45)
+        for start, end in box_edges:
+            x1, y1 = project(*start)
+            x2, y2 = project(*end)
+            canvas.line(x1, y1, x2, y2)
+
+        canvas.setStrokeColor(colors.HexColor("#dbe7ef"))
+        canvas.setLineWidth(0.35)
+        for index in range(1, 4):
+            z = index / 4
+            for start, end in [
+                ((-1, -1, z), (1, -1, z)),
+                ((-1, -1, z), (-1, 1, z)),
+                ((-1, 1, 0), (1, 1, 0)),
+                ((index / 2 - 1, -1, 0), (index / 2 - 1, 1, 0)),
+            ]:
+                x1, y1 = project(*start)
+                x2, y2 = project(*end)
+                canvas.line(x1, y1, x2, y2)
+
+        top_points = [projected(point) for point in self.profile]
+        ground_points = [projected(point, ground=True) for point in self.profile]
+
+        canvas.setFillColor(colors.HexColor("#dcfce7"))
+        if hasattr(canvas, "setFillAlpha"):
+            canvas.setFillAlpha(0.55)
+        for index in range(len(top_points) - 1):
+            path = canvas.beginPath()
+            path.moveTo(ground_points[index][0], ground_points[index][1])
+            path.lineTo(top_points[index][0], top_points[index][1])
+            path.lineTo(top_points[index + 1][0], top_points[index + 1][1])
+            path.lineTo(ground_points[index + 1][0], ground_points[index + 1][1])
+            path.close()
+            canvas.drawPath(path, stroke=0, fill=1)
+        if hasattr(canvas, "setFillAlpha"):
+            canvas.setFillAlpha(1)
+
+        draw_line(ground_points, colors.HexColor("#94a3b8"), 0.55)
+        draw_line(top_points, colors.HexColor("#166534"), 2.1)
+
+        canvas.setFillColor(colors.white)
+        canvas.setStrokeColor(colors.HexColor("#166534"))
+        canvas.setLineWidth(1.2)
+        for x, y in (top_points[0], top_points[-1]):
+            canvas.circle(x, y, 2.4, stroke=1, fill=1)
+
+        waypoint_points = [projected(point) for point in self.waypoints]
+        waypoint_ground_points = [projected(point, ground=True) for point in self.waypoints]
+        draw_line(waypoint_points, colors.HexColor("#f97316"), 1.0)
+
+        canvas.setFont("HeiseiKakuGo-W5", 7.2)
+        for index, waypoint in enumerate(self.waypoints):
+            x, y = waypoint_points[index]
+            gx, gy = waypoint_ground_points[index]
+            canvas.setStrokeColor(colors.HexColor("#fb923c"))
+            canvas.setLineWidth(0.5)
+            canvas.line(gx, gy, x, y)
+            canvas.setFillColor(colors.HexColor("#f97316"))
+            canvas.setStrokeColor(colors.white)
+            canvas.circle(x, y, 2.8, stroke=1, fill=1)
+
+            waypoint_seq = waypoint.get("seq")
+            label_seq = index if waypoint_seq in ("", None) else waypoint_seq
+            label = f"WP{label_seq} {_format_meters(waypoint.get('altitude_m'))}"
+            label_width = canvas.stringWidth(label, "HeiseiKakuGo-W5", 7.2) + 4 * mm
+            label_x = min(max(x + 2.5 * mm, 2 * mm), self.width - label_width - 2 * mm)
+            label_y = min(max(y + 2 * mm, 2 * mm), self.height - 8 * mm)
+            canvas.setFillColor(colors.white)
+            canvas.setStrokeColor(colors.HexColor("#fed7aa"))
+            canvas.roundRect(label_x, label_y - 1.5 * mm, label_width, 5 * mm, 2, fill=1, stroke=1)
+            canvas.setFillColor(colors.HexColor("#c2410c"))
+            canvas.drawString(label_x + 2 * mm, label_y, label)
+
+        canvas.setFont("HeiseiKakuGo-W5", 8)
+        canvas.setFillColor(colors.HexColor("#475569"))
+        for label, point in [
+            ("X", (1.08, 1.02, 0.0)),
+            ("Y", (-1.1, 1.12, 0.0)),
+            ("Z", (-1.1, -1.08, 1.03)),
+        ]:
+            x, y = project(*point)
+            canvas.drawString(x, y, label)
 
 
 @dataclass
@@ -199,6 +462,27 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _coordinate_origin(samples: list[dict[str, Any]]) -> tuple[float, float] | None:
+    for sample in samples:
+        lat = sample.get("lat")
+        lng = sample.get("lng")
+        if lat is not None and lng is not None:
+            return float(lat), float(lng)
+    return None
+
+
+def _local_xy_m(lat: float, lng: float, origin: tuple[float, float]) -> tuple[float, float]:
+    origin_lat, origin_lng = origin
+    mean_lat = math.radians((origin_lat + lat) / 2)
+    x_m = math.radians(lng - origin_lng) * 6371000.0 * math.cos(mean_lat)
+    y_m = math.radians(lat - origin_lat) * 6371000.0
+    return x_m, y_m
+
+
+def _is_relative_altitude_frame(frame: int | None) -> bool:
+    return frame in {3, 6, 10, 11}
+
+
 def _detect_takeoff_and_landing(samples: list[dict[str, Any]]) -> tuple[datetime | None, datetime | None, bool]:
     if not samples:
         return None, None, True
@@ -240,6 +524,89 @@ def _detect_takeoff_and_landing(samples: list[dict[str, Any]]) -> tuple[datetime
     return takeoff_at, landing_at, review_required
 
 
+def _build_altitude_profile(samples: list[dict[str, Any]], max_points: int = 180) -> list[dict[str, Any]]:
+    valid_samples = [
+        sample
+        for sample in samples
+        if sample.get("timestamp") is not None and sample.get("altitude") is not None
+    ]
+    if not valid_samples:
+        return []
+
+    first_timestamp = valid_samples[0]["timestamp"]
+    base_altitude = float(valid_samples[0]["altitude"])
+    origin = _coordinate_origin(valid_samples)
+    step = max(math.ceil(len(valid_samples) / max_points), 1)
+    sampled = valid_samples[::step]
+    if sampled[-1] is not valid_samples[-1]:
+        sampled.append(valid_samples[-1])
+
+    profile: list[dict[str, Any]] = []
+    for sample in sampled:
+        timestamp = sample["timestamp"]
+        altitude = float(sample["altitude"])
+        speed = sample.get("speed")
+        lat = sample.get("lat")
+        lng = sample.get("lng")
+        time_s = max((timestamp - first_timestamp).total_seconds(), 0.0)
+        if origin and lat is not None and lng is not None:
+            x_m, y_m = _local_xy_m(float(lat), float(lng), origin)
+        else:
+            x_m, y_m = time_s, 0.0
+        point = {
+            "time_s": round(time_s, 2),
+            "altitude_m": round(altitude, 2),
+            "relative_altitude_m": round(altitude - base_altitude, 2),
+            "speed_mps": round(float(speed), 2) if speed is not None else None,
+            "x_m": round(x_m, 2),
+            "y_m": round(y_m, 2),
+        }
+        if lat is not None and lng is not None:
+            point["lat"] = round(float(lat), 7)
+            point["lng"] = round(float(lng), 7)
+        profile.append(point)
+    return profile
+
+
+def _build_waypoints(
+    waypoint_samples: list[dict[str, Any]],
+    timeline_samples: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not waypoint_samples:
+        return []
+
+    origin = _coordinate_origin(timeline_samples) or _coordinate_origin(waypoint_samples)
+    altitude_samples = [sample for sample in timeline_samples if sample.get("altitude") is not None]
+    base_altitude = float(altitude_samples[0]["altitude"]) if altitude_samples else 0.0
+    waypoints: list[dict[str, Any]] = []
+
+    for sample in sorted(waypoint_samples, key=lambda item: item.get("seq") if item.get("seq") is not None else 999999):
+        lat = sample.get("lat")
+        lng = sample.get("lng")
+        if lat is None or lng is None:
+            continue
+        altitude = sample.get("altitude")
+        frame = sample.get("frame")
+        altitude_value = float(altitude) if altitude is not None else base_altitude
+        relative_altitude = altitude_value if _is_relative_altitude_frame(frame) else altitude_value - base_altitude
+        x_m, y_m = _local_xy_m(float(lat), float(lng), origin) if origin else (0.0, 0.0)
+        seq = sample.get("seq")
+        waypoints.append(
+            {
+                "seq": int(seq) if seq is not None else len(waypoints),
+                "command": sample.get("command"),
+                "frame": frame,
+                "lat": round(float(lat), 7),
+                "lng": round(float(lng), 7),
+                "altitude_m": round(altitude_value, 2),
+                "relative_altitude_m": round(relative_altitude, 2),
+                "x_m": round(x_m, 2),
+                "y_m": round(y_m, 2),
+            }
+        )
+    return waypoints
+
+
 def parse_log_file(file_path: Path) -> ParsedFlightLog:
     suffix = file_path.suffix.lower()
     if suffix == ".bin":
@@ -251,6 +618,8 @@ def parse_log_file(file_path: Path) -> ParsedFlightLog:
 
     parsed = ParsedFlightLog()
     timeline_samples: list[dict[str, Any]] = []
+    waypoint_samples: list[dict[str, Any]] = []
+    waypoint_keys: set[tuple[Any, ...]] = set()
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
     current_mode: str | None = None
@@ -316,8 +685,39 @@ def parse_log_file(file_path: Path) -> ParsedFlightLog:
                     "timestamp": timestamp,
                     "altitude": alt,
                     "speed": speed,
+                    "lat": lat,
+                    "lng": lng,
                 }
             )
+
+        if message_type == "CMD":
+            seq = _safe_int(message, ["CNum", "Seq", "Num"])
+            command = _safe_int(message, ["CId", "Cmd", "Command"])
+            frame = _safe_int(message, ["Frame"])
+            lat = _normalize_coord(_safe_float(message, ["Lat", "lat"]), 90)
+            lng = _normalize_coord(_safe_float(message, ["Lng", "Lon", "lng", "lon"]), 180)
+            altitude = _normalize_altitude(_safe_float(message, ["Alt", "Altitude"]))
+            if lat is not None and lng is not None and abs(lat) > 0.000001 and abs(lng) > 0.000001:
+                key = (
+                    seq,
+                    command,
+                    frame,
+                    round(lat, 7),
+                    round(lng, 7),
+                    round(altitude or 0.0, 2),
+                )
+                if key not in waypoint_keys:
+                    waypoint_keys.add(key)
+                    waypoint_samples.append(
+                        {
+                            "seq": seq,
+                            "command": command,
+                            "frame": frame,
+                            "lat": lat,
+                            "lng": lng,
+                            "altitude": altitude,
+                        }
+                    )
 
         if message_type in {"BAT", "BATT", "CURR"}:
             voltage = _safe_float(message, ["Volt", "VoltR", "V"])
@@ -379,10 +779,16 @@ def parse_log_file(file_path: Path) -> ParsedFlightLog:
 
     parsed.ekf_summary = "重大なEKFイベントは検出されませんでした。"
     parsed.vibration_summary = "振動データの高度な解析はMVPでは簡易判定です。"
+    altitude_profile = _build_altitude_profile(timeline_samples)
+    waypoints = _build_waypoints(waypoint_samples, timeline_samples)
     parsed.summary_json = {
         "mode_count": len(parsed.mode_spans),
         "warning_count": len(parsed.warning_messages),
         "error_count": len(parsed.error_messages),
+        "altitude_profile": altitude_profile,
+        "altitude_profile_count": len(altitude_profile),
+        "waypoints": waypoints,
+        "waypoint_count": len(waypoints),
     }
     return parsed
 
@@ -568,12 +974,21 @@ def generate_pdf_asset(record: FlightRecord) -> GeneratedAsset:
     story.extend([reference_table, Spacer(1, 4 * mm)])
     story.append(Paragraph("※ 参考値は正式記録ではありません。正式値は操縦者入力です。", styles["Japanese"]))
 
-    if hasattr(record, "analysis"):
+    analysis = record.analysis if hasattr(record, "analysis") else None
+    if analysis is not None:
         story.extend([Spacer(1, 6 * mm), Paragraph("解析サマリ", styles["JapaneseTitle"])])
-        for message in record.analysis.warning_messages:
+        for message in analysis.warning_messages:
             story.append(Paragraph(f"・{message}", styles["Japanese"]))
-        for message in record.analysis.error_messages:
+        for message in analysis.error_messages:
             story.append(Paragraph(f"・{message}", styles["Japanese"]))
+
+        summary_json = analysis.summary_json or {}
+        altitude_chart = AltitudeProfile3DChart(
+            summary_json.get("altitude_profile") or [],
+            summary_json.get("waypoints") or [],
+        )
+        if altitude_chart.has_data:
+            story.extend([Spacer(1, 5 * mm), altitude_chart])
 
     document.build(story)
     payload = buffer.getvalue()

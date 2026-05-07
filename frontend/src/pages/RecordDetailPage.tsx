@@ -1,14 +1,15 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useParams } from "react-router-dom";
 import { z } from "zod";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { MapContainer, Marker, Polyline, Popup, TileLayer } from "react-leaflet";
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { Panel } from "../components/Panel";
 import { StatusBadge } from "../components/StatusBadge";
 import { api } from "../lib/api";
-import { Aircraft, FlightRecord, Pilot } from "../lib/types";
+import { Aircraft, AltitudeProfilePoint, FlightRecord, Pilot, WaypointPoint } from "../lib/types";
 
 const schema = z.object({
   aircraft: z.coerce.number().nullable(),
@@ -22,6 +23,363 @@ const schema = z.object({
   safety_notes: z.string().default(""),
   article_notes: z.string().default(""),
 });
+
+function formatNumber(value: number | null | undefined, digits = 1) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "-";
+  }
+  return value.toFixed(digits);
+}
+
+function formatAltitudeMeters(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "-";
+  }
+  const rounded = Math.round(value * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}m`;
+}
+
+function addCylinderBetween(scene: THREE.Scene | THREE.Group, start: THREE.Vector3, end: THREE.Vector3, material: THREE.Material, radius = 0.045) {
+  const direction = new THREE.Vector3().subVectors(end, start);
+  const length = direction.length();
+  if (length <= 0) {
+    return;
+  }
+
+  const geometry = new THREE.CylinderGeometry(radius, radius, length, 12);
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.position.copy(new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5));
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+  scene.add(mesh);
+}
+
+function addLine(scene: THREE.Scene | THREE.Group, points: THREE.Vector3[], material: THREE.LineBasicMaterial) {
+  if (points.length < 2) {
+    return;
+  }
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  scene.add(new THREE.Line(geometry, material));
+}
+
+function addLineSegments(scene: THREE.Scene | THREE.Group, segments: THREE.Vector3[], material: THREE.LineBasicMaterial) {
+  if (segments.length < 2) {
+    return;
+  }
+  const geometry = new THREE.BufferGeometry().setFromPoints(segments);
+  scene.add(new THREE.LineSegments(geometry, material));
+}
+
+function createLabelSprite(text: string, color = "#334155", width = 256, scaleX = 0.72) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = 96;
+  const context = canvas.getContext("2d");
+  if (context) {
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.font = "700 42px sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.lineWidth = 8;
+    context.strokeStyle = "rgba(255,255,255,0.92)";
+    context.strokeText(text, canvas.width / 2, canvas.height / 2);
+    context.fillStyle = color;
+    context.fillText(text, canvas.width / 2, canvas.height / 2);
+  }
+  const texture = new THREE.CanvasTexture(canvas);
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+  const sprite = new THREE.Sprite(material);
+  sprite.scale.set(scaleX, 0.27, 1);
+  return sprite;
+}
+
+type AltitudeProfile3DProps = {
+  profile: AltitudeProfilePoint[];
+  waypoints: WaypointPoint[];
+};
+
+function AltitudeProfile3D({ profile, waypoints }: AltitudeProfile3DProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hasProfile = profile.length >= 2;
+
+  useEffect(() => {
+    if (!hasProfile || !containerRef.current || !canvasRef.current) {
+      return;
+    }
+
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xf8fbfd);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+    const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 120);
+    camera.position.set(7.4, 6.2, 8.6);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 4.5;
+    controls.maxDistance = 22;
+    controls.target.set(0, 2.1, 0);
+
+    const renderScene = () => {
+      renderer.render(scene, camera);
+    };
+
+    const resize = () => {
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderScene();
+    };
+
+    const group = new THREE.Group();
+    scene.add(group);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.35));
+    const light = new THREE.DirectionalLight(0xffffff, 1.9);
+    light.position.set(3, 7, 4);
+    scene.add(light);
+    const fillLight = new THREE.DirectionalLight(0xdcfce7, 0.7);
+    fillLight.position.set(-5, 4, -6);
+    scene.add(fillLight);
+
+    const plotWaypoints = waypoints.filter(
+      (point) => Number.isFinite(point.x_m) && Number.isFinite(point.y_m) && Number.isFinite(point.relative_altitude_m),
+    );
+    const xValues = [...profile.map((point) => point.x_m), ...plotWaypoints.map((point) => point.x_m)];
+    const yValues = [...profile.map((point) => point.y_m), ...plotWaypoints.map((point) => point.y_m)];
+    const altitudeValues = [
+      ...profile.map((point) => Math.max(point.relative_altitude_m ?? 0, 0)),
+      ...plotWaypoints.map((point) => Math.max(point.relative_altitude_m ?? 0, 0)),
+    ];
+    const xMin = Math.min(...xValues);
+    const xMax = Math.max(...xValues);
+    const yMin = Math.min(...yValues);
+    const yMax = Math.max(...yValues);
+    const xCenter = (xMin + xMax) / 2;
+    const yCenter = (yMin + yMax) / 2;
+    const horizontalScale = 8.2 / Math.max(xMax - xMin, yMax - yMin, 1);
+    const verticalScale = 4.7 / Math.max(...altitudeValues, 1);
+
+    const toScenePoint = (x_m: number, y_m: number, relative_altitude_m: number, groundLevel = false) =>
+      new THREE.Vector3(
+        (x_m - xCenter) * horizontalScale,
+        groundLevel ? 0.05 : Math.max(relative_altitude_m, 0) * verticalScale + 0.08,
+        (y_m - yCenter) * horizontalScale,
+      );
+
+    const topPoints = profile.map((point) => toScenePoint(point.x_m, point.y_m, point.relative_altitude_m ?? 0));
+    const groundPoints = profile.map((point) => toScenePoint(point.x_m, point.y_m, point.relative_altitude_m ?? 0, true));
+    const waypointPoints = plotWaypoints.map((point) => toScenePoint(point.x_m, point.y_m, point.relative_altitude_m ?? 0));
+
+    const boxHalfX = 4.7;
+    const boxHalfZ = 4.35;
+    const boxHeight = 4.95;
+
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(boxHalfX * 2, boxHalfZ * 2),
+      new THREE.MeshBasicMaterial({ color: 0xf4fbf7, side: THREE.DoubleSide }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.set(0, 0, 0);
+    group.add(ground);
+
+    const grid = new THREE.GridHelper(boxHalfX * 2, 8, 0xcbddea, 0xddebf2);
+    grid.position.set(0, 0.01, -2.6);
+    grid.scale.z = (boxHalfZ * 2) / (boxHalfX * 2);
+    grid.position.z = 0;
+    group.add(grid);
+
+    const boxMaterial = new THREE.LineBasicMaterial({ color: 0xcbd5df, transparent: true, opacity: 0.8 });
+    const boxSegments: THREE.Vector3[] = [];
+    const corners = [
+      new THREE.Vector3(-boxHalfX, 0, -boxHalfZ),
+      new THREE.Vector3(boxHalfX, 0, -boxHalfZ),
+      new THREE.Vector3(boxHalfX, 0, boxHalfZ),
+      new THREE.Vector3(-boxHalfX, 0, boxHalfZ),
+      new THREE.Vector3(-boxHalfX, boxHeight, -boxHalfZ),
+      new THREE.Vector3(boxHalfX, boxHeight, -boxHalfZ),
+      new THREE.Vector3(boxHalfX, boxHeight, boxHalfZ),
+      new THREE.Vector3(-boxHalfX, boxHeight, boxHalfZ),
+    ];
+    [
+      [0, 1], [1, 2], [2, 3], [3, 0],
+      [4, 5], [5, 6], [6, 7], [7, 4],
+      [0, 4], [1, 5], [2, 6], [3, 7],
+    ].forEach(([start, end]) => {
+      boxSegments.push(corners[start], corners[end]);
+    });
+    for (let index = 1; index < 4; index += 1) {
+      const y = (boxHeight / 4) * index;
+      boxSegments.push(new THREE.Vector3(-boxHalfX, y, -boxHalfZ), new THREE.Vector3(boxHalfX, y, -boxHalfZ));
+      boxSegments.push(new THREE.Vector3(-boxHalfX, y, -boxHalfZ), new THREE.Vector3(-boxHalfX, y, boxHalfZ));
+    }
+    addLineSegments(group, boxSegments, boxMaterial);
+
+    const labelX = createLabelSprite("X");
+    labelX.position.set(boxHalfX + 0.45, 0.22, boxHalfZ);
+    group.add(labelX);
+    const labelY = createLabelSprite("Y");
+    labelY.position.set(-boxHalfX, 0.22, boxHalfZ + 0.52);
+    group.add(labelY);
+    const labelZ = createLabelSprite("Z");
+    labelZ.position.set(-boxHalfX - 0.35, boxHeight + 0.24, -boxHalfZ);
+    group.add(labelZ);
+
+    const ribbonHalfWidth = 0.23;
+    const wallVertices: number[] = [];
+    const wallIndices: number[] = [];
+    const ribbonVertices: number[] = [];
+    const ribbonIndices: number[] = [];
+    for (let index = 0; index < topPoints.length; index += 1) {
+      const previous = topPoints[Math.max(index - 1, 0)];
+      const next = topPoints[Math.min(index + 1, topPoints.length - 1)];
+      const tangentX = next.x - previous.x;
+      const tangentZ = next.z - previous.z;
+      const tangentLength = Math.hypot(tangentX, tangentZ);
+      const normal = tangentLength > 0.001
+        ? new THREE.Vector3(-tangentZ / tangentLength, 0, tangentX / tangentLength).multiplyScalar(ribbonHalfWidth)
+        : new THREE.Vector3(ribbonHalfWidth, 0, 0);
+      const left = topPoints[index].clone().add(normal);
+      const right = topPoints[index].clone().sub(normal);
+      ribbonVertices.push(left.x, left.y, left.z, right.x, right.y, right.z);
+      wallVertices.push(groundPoints[index].x, groundPoints[index].y, groundPoints[index].z);
+      wallVertices.push(topPoints[index].x, topPoints[index].y, topPoints[index].z);
+      if (index < topPoints.length - 1) {
+        const base = index * 2;
+        ribbonIndices.push(base, base + 1, base + 3, base, base + 3, base + 2);
+        wallIndices.push(base, base + 1, base + 3, base, base + 3, base + 2);
+      }
+    }
+
+    const ribbonGeometry = new THREE.BufferGeometry();
+    ribbonGeometry.setAttribute("position", new THREE.Float32BufferAttribute(ribbonVertices, 3));
+    ribbonGeometry.setIndex(ribbonIndices);
+    ribbonGeometry.computeVertexNormals();
+    group.add(
+      new THREE.Mesh(
+        ribbonGeometry,
+        new THREE.MeshPhongMaterial({
+          color: 0x166534,
+          side: THREE.DoubleSide,
+          shininess: 86,
+        }),
+      ),
+    );
+
+    const wallGeometry = new THREE.BufferGeometry();
+    wallGeometry.setAttribute("position", new THREE.Float32BufferAttribute(wallVertices, 3));
+    wallGeometry.setIndex(wallIndices);
+    wallGeometry.computeVertexNormals();
+    group.add(
+      new THREE.Mesh(
+        wallGeometry,
+        new THREE.MeshPhongMaterial({
+          color: 0x22c55e,
+          transparent: true,
+          opacity: 0.16,
+          side: THREE.DoubleSide,
+          shininess: 22,
+        }),
+      ),
+    );
+
+    const lineMaterial = new THREE.MeshPhongMaterial({ color: 0x052e16, shininess: 70 });
+    const shadowMaterial = new THREE.MeshBasicMaterial({ color: 0x64748b, transparent: true, opacity: 0.38 });
+    for (let index = 0; index < topPoints.length - 1; index += 1) {
+      addCylinderBetween(group, topPoints[index], topPoints[index + 1], lineMaterial, 0.035);
+      addCylinderBetween(group, groundPoints[index], groundPoints[index + 1], shadowMaterial, 0.014);
+    }
+
+    const markerGeometry = new THREE.SphereGeometry(0.13, 18, 18);
+    const startMaterial = new THREE.MeshPhongMaterial({ color: 0xffffff, emissive: 0x16a34a, emissiveIntensity: 0.18 });
+    [0, topPoints.length - 1].forEach((index) => {
+      const marker = new THREE.Mesh(markerGeometry, startMaterial);
+      marker.position.copy(topPoints[index]);
+      group.add(marker);
+    });
+
+    if (waypointPoints.length > 0) {
+      const waypointMaterial = new THREE.MeshPhongMaterial({ color: 0xf97316, emissive: 0xf97316, emissiveIntensity: 0.18 });
+      const waypointLineMaterial = new THREE.LineBasicMaterial({ color: 0xf97316, transparent: true, opacity: 0.72 });
+      const waypointStemMaterial = new THREE.MeshBasicMaterial({ color: 0xf97316, transparent: true, opacity: 0.42 });
+      addLine(group, waypointPoints, waypointLineMaterial);
+      waypointPoints.forEach((position, index) => {
+        const waypoint = plotWaypoints[index];
+        const marker = new THREE.Mesh(new THREE.SphereGeometry(0.14, 18, 18), waypointMaterial);
+        marker.position.copy(position);
+        group.add(marker);
+        addCylinderBetween(group, new THREE.Vector3(position.x, 0.05, position.z), position, waypointStemMaterial, 0.014);
+        const label = createLabelSprite(`WP${waypoint.seq} ${formatAltitudeMeters(waypoint.altitude_m)}`, "#c2410c", 384, 0.98);
+        label.position.set(position.x, position.y + 0.34 + (index % 2) * 0.16, position.z);
+        group.add(label);
+      });
+    }
+
+    const axisMaterial = new THREE.MeshBasicMaterial({ color: 0x475569 });
+    addCylinderBetween(group, new THREE.Vector3(-boxHalfX, 0.04, boxHalfZ), new THREE.Vector3(boxHalfX, 0.04, boxHalfZ), axisMaterial, 0.018);
+    addCylinderBetween(group, new THREE.Vector3(-boxHalfX, 0.04, -boxHalfZ), new THREE.Vector3(-boxHalfX, 0.04, boxHalfZ), axisMaterial, 0.018);
+    addCylinderBetween(group, new THREE.Vector3(-boxHalfX, 0.04, -boxHalfZ), new THREE.Vector3(-boxHalfX, boxHeight, -boxHalfZ), axisMaterial, 0.018);
+
+    resize();
+    const observer = new ResizeObserver(resize);
+    observer.observe(container);
+
+    let animationFrame = 0;
+    const animate = () => {
+      controls.update();
+      renderScene();
+      animationFrame = window.requestAnimationFrame(animate);
+    };
+    animate();
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      observer.disconnect();
+      controls.dispose();
+      group.traverse((object) => {
+        if (object instanceof THREE.Mesh || object instanceof THREE.LineSegments) {
+          object.geometry.dispose();
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          materials.forEach((material) => material.dispose());
+        }
+        if (object instanceof THREE.Line) {
+          object.geometry.dispose();
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          materials.forEach((material) => material.dispose());
+        }
+        if (object instanceof THREE.Sprite) {
+          object.material.map?.dispose();
+          object.material.dispose();
+        }
+      });
+      renderer.dispose();
+    };
+  }, [hasProfile, profile, waypoints]);
+
+  if (!hasProfile) {
+    return (
+      <div className="flex h-full min-h-72 items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-white/70 px-4 text-center text-sm font-semibold text-slate-500">
+        高度時系列データがまだありません。ログを再解析すると3D高度グラフを表示できます。
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-full min-h-72 overflow-hidden rounded-2xl border border-slate-200 bg-slate-50" ref={containerRef}>
+      <canvas className="block h-full w-full" ref={canvasRef} />
+      <div className="pointer-events-none absolute left-4 top-4 rounded-xl border border-slate-200 bg-white/85 px-3 py-2 text-xs font-semibold text-slate-600 shadow-sm">
+        3D高度 / waypoint
+      </div>
+    </div>
+  );
+}
 
 export function RecordDetailPage() {
   const { recordId } = useParams();
@@ -91,15 +449,26 @@ export function RecordDetailPage() {
     }
   }
 
+  const altitudeProfile = useMemo(
+    () => (
+      record?.analysis?.summary_json?.altitude_profile?.filter(
+        (point) => Number.isFinite(point.time_s) && Number.isFinite(point.altitude_m) && Number.isFinite(point.x_m) && Number.isFinite(point.y_m),
+      ) ?? []
+    ),
+    [record?.analysis?.summary_json?.altitude_profile],
+  );
+  const waypoints = useMemo(
+    () => (
+      record?.analysis?.summary_json?.waypoints?.filter(
+        (point) => Number.isFinite(point.x_m) && Number.isFinite(point.y_m) && Number.isFinite(point.relative_altitude_m),
+      ) ?? []
+    ),
+    [record?.analysis?.summary_json?.waypoints],
+  );
+
   if (!record) {
     return <Panel title="読み込み中" eyebrow="Log" />;
   }
-
-  const metrics = [
-    { name: "高度", value: record.analysis?.max_altitude_m ?? 0 },
-    { name: "速度", value: record.analysis?.max_speed_mps ?? 0 },
-    { name: "距離", value: record.analysis?.max_distance_m ?? 0 },
-  ];
 
   const mapReady = record.takeoff_lat !== null && record.takeoff_lng !== null && record.landing_lat !== null && record.landing_lng !== null;
 
@@ -167,17 +536,37 @@ export function RecordDetailPage() {
                 <p>参考気象: {record.reference_weather || "参考値なし"}</p>
               </div>
             </div>
-            <div className="panel-muted h-80 p-4">
-              <p className="mb-3 text-sm font-semibold text-slate-500">指標</p>
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={metrics}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#d6e2ea" />
-                  <XAxis dataKey="name" stroke="#587080" />
-                  <YAxis stroke="#587080" />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="value" stroke="#0f8ec7" strokeWidth={3} />
-                </LineChart>
-              </ResponsiveContainer>
+            <div className="panel-muted p-4">
+              <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-500">高度プロファイル</p>
+                  <p className="mt-1 text-lg font-bold text-ink">3D高度変化</p>
+                </div>
+                <div className="grid grid-cols-4 gap-2 text-right text-xs text-slate-500">
+                  <div>
+                    <p className="font-semibold text-slate-400">最大高度</p>
+                    <p className="text-sm font-bold text-slate-700">{formatNumber(record.analysis?.max_altitude_m)} m</p>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-400">最大速度</p>
+                    <p className="text-sm font-bold text-slate-700">{formatNumber(record.analysis?.max_speed_mps)} m/s</p>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-400">飛行時間</p>
+                    <p className="text-sm font-bold text-slate-700">{record.duration_seconds ?? 0} 秒</p>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-400">WP</p>
+                    <p className="text-sm font-bold text-slate-700">{waypoints.length}</p>
+                  </div>
+                </div>
+              </div>
+              <div className="h-96">
+                <AltitudeProfile3D
+                  profile={altitudeProfile}
+                  waypoints={waypoints}
+                />
+              </div>
             </div>
             <div className="panel-muted overflow-hidden p-0">
               <div className="border-b border-slate-200 px-4 py-3 text-sm font-semibold text-slate-500">地図</div>

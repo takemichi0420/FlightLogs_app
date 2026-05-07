@@ -9,6 +9,7 @@ from pymavlink import mavutil
 
 MAX_LOG_BYTES = int(os.getenv("MAVLINK_LOG_MAX_BYTES", str(200 * 1024 * 1024)))
 LOG_DATA_CHUNK_SIZE = 90
+LOG_REQUEST_WINDOW_SIZE = int(os.getenv("MAVLINK_LOG_REQUEST_WINDOW_BYTES", str(64 * 1024)))
 
 
 class MavlinkImportError(RuntimeError):
@@ -105,46 +106,63 @@ def _download_log_data(master, entry: MavlinkLogEntry, timeout_s: float) -> byte
 
     payload = bytearray(entry.size)
     offset = 0
-    chunk_timeout_s = max(2.0, min(timeout_s, 10.0))
+    chunk_timeout_s = max(5.0, min(timeout_s, 30.0))
+    window_size = max(LOG_DATA_CHUNK_SIZE, LOG_REQUEST_WINDOW_SIZE)
 
     try:
         while offset < entry.size:
-            requested = min(LOG_DATA_CHUNK_SIZE, entry.size - offset)
-            received = False
+            window_start = offset
+            window_end = min(window_start + window_size, entry.size)
+            requested = window_end - window_start
+            received_offsets: set[int] = set()
+            received_bytes = 0
 
             for _attempt in range(3):
                 master.mav.log_request_data_send(
                     master.target_system,
                     master.target_component,
                     entry.id,
-                    offset,
+                    window_start,
                     requested,
                 )
                 deadline = time.monotonic() + chunk_timeout_s
 
-                while time.monotonic() < deadline:
+                while time.monotonic() < deadline and received_bytes < requested:
                     message = master.recv_match(type="LOG_DATA", blocking=True, timeout=0.5)
                     if message is None:
                         continue
                     if int(message.id) != entry.id:
                         continue
-                    if int(message.ofs) != offset:
+
+                    message_offset = int(message.ofs)
+                    if message_offset < window_start or message_offset >= window_end:
+                        continue
+                    if message_offset in received_offsets:
                         continue
 
-                    count = min(int(message.count), len(message.data), entry.size - offset)
+                    count = min(int(message.count), len(message.data), window_end - message_offset)
                     if count <= 0:
                         continue
 
-                    payload[offset : offset + count] = bytes(message.data[:count])
-                    offset += count
-                    received = True
+                    payload[message_offset : message_offset + count] = bytes(message.data[:count])
+                    received_offsets.add(message_offset)
+                    received_bytes += count
+
+                if received_bytes >= requested:
                     break
 
-                if received:
-                    break
+            if received_bytes < requested:
+                missing_offset = next(
+                    (
+                        candidate
+                        for candidate in range(window_start, window_end, LOG_DATA_CHUNK_SIZE)
+                        if candidate not in received_offsets
+                    ),
+                    window_start,
+                )
+                raise MavlinkImportError(f"ログデータの受信がタイムアウトしました。offset={missing_offset}")
 
-            if not received:
-                raise MavlinkImportError(f"ログデータの受信がタイムアウトしました。offset={offset}")
+            offset = window_end
     finally:
         try:
             master.mav.log_request_end_send(master.target_system, master.target_component)
