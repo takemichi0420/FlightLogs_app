@@ -7,20 +7,49 @@ import { api } from "../lib/api";
 import { Paginated, Pilot } from "../lib/types";
 
 const schema = z.object({
-  name: z.string().min(1),
-  license_number: z.string().optional(),
-  organization: z.string().optional(),
+  name: z.string().trim().min(1, "氏名を入力してください"),
+  license_number: z.string().trim().optional().default(""),
+  organization: z.string().trim().optional().default(""),
 });
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error && typeof error === "object" && "response" in error) {
+    const response = (error as { response?: { data?: Record<string, unknown> } }).response;
+    const data = response?.data;
+    if (typeof data?.detail === "string") {
+      return data.detail;
+    }
+    if (typeof data?.message === "string") {
+      return data.message;
+    }
+    for (const value of Object.values(data ?? {})) {
+      if (Array.isArray(value) && value[0]) {
+        return String(value[0]);
+      }
+      if (typeof value === "string") {
+        return value;
+      }
+    }
+  }
+  return fallback;
+}
 
 export function PilotsPage() {
   const [items, setItems] = useState<Pilot[]>([]);
-  const { register, handleSubmit, reset, formState: { isSubmitting } } = useForm<z.infer<typeof schema>>({
+  const [message, setMessage] = useState("");
+  const [submitError, setSubmitError] = useState("");
+  const { register, handleSubmit, reset, formState: { errors, isSubmitting } } = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
+    defaultValues: { name: "", license_number: "", organization: "" },
   });
 
   async function load() {
-    const response = await api.get<Paginated<Pilot>>("/pilots/");
-    setItems(response.data.results);
+    try {
+      const response = await api.get<Paginated<Pilot>>("/pilots/");
+      setItems(response.data.results);
+    } catch (error) {
+      setSubmitError(getErrorMessage(error, "操縦者一覧を取得できませんでした。"));
+    }
   }
 
   useEffect(() => {
@@ -28,24 +57,44 @@ export function PilotsPage() {
   }, []);
 
   async function onSubmit(values: z.infer<typeof schema>) {
-    await api.post("/pilots/", values);
-    reset({ name: "", license_number: "", organization: "" });
-    await load();
+    setMessage("");
+    setSubmitError("");
+    try {
+      await api.post("/pilots/", values);
+      reset({ name: "", license_number: "", organization: "" });
+      await load();
+      setMessage("操縦者を登録しました。");
+    } catch (error) {
+      setSubmitError(getErrorMessage(error, "操縦者を登録できませんでした。"));
+    }
   }
 
   async function remove(id: number) {
-    await api.delete(`/pilots/${id}/`);
-    await load();
+    setMessage("");
+    setSubmitError("");
+    try {
+      await api.delete(`/pilots/${id}/`);
+      await load();
+      setMessage("操縦者を削除しました。");
+    } catch (error) {
+      setSubmitError(getErrorMessage(error, "操縦者を削除できませんでした。"));
+    }
   }
 
   return (
     <div className="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
       <Panel title="操縦者登録" eyebrow="Master">
         <form className="space-y-4" onSubmit={handleSubmit(onSubmit)}>
-          <div><label className="label">氏名</label><input className="input" {...register("name")} /></div>
+          <div>
+            <label className="label">氏名</label>
+            <input className="input" {...register("name")} />
+            {errors.name ? <p className="mt-2 text-sm text-rose-600">{errors.name.message}</p> : null}
+          </div>
           <div><label className="label">技能証明番号</label><input className="input" {...register("license_number")} /></div>
           <div><label className="label">所属</label><input className="input" {...register("organization")} /></div>
           <button className="btn-primary w-full" disabled={isSubmitting} type="submit">{isSubmitting ? "保存中..." : "操縦者を保存"}</button>
+          {message ? <p className="text-sm font-semibold text-sky-700">{message}</p> : null}
+          {submitError ? <p className="text-sm font-semibold text-rose-600">{submitError}</p> : null}
         </form>
       </Panel>
       <Panel title="操縦者一覧" eyebrow="List">

@@ -14,21 +14,112 @@ import { Aircraft, AltitudeProfilePoint, FlightRecord, Pilot, WaypointPoint } fr
 const schema = z.object({
   aircraft: z.coerce.number().nullable(),
   pilot: z.coerce.number().nullable(),
-  purpose: z.string().default(""),
-  special_flight_types: z.string().default(""),
+  purpose: z.array(z.string()).default([]),
+  purpose_other: z.string().default(""),
+  special_flight_types: z.array(z.string()).default([]),
   route_summary: z.string().default(""),
   official_weather: z.string().min(1),
   official_temperature_c: z.coerce.number(),
   official_wind_speed_mps: z.coerce.number(),
   safety_notes: z.string().default(""),
   article_notes: z.string().default(""),
+}).superRefine((values, context) => {
+  if (values.purpose.includes("その他") && !values.purpose_other.trim()) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "その他の内容を入力してください",
+      path: ["purpose_other"],
+    });
+  }
 });
+
+const PURPOSE_OPTIONS = [
+  "空撮",
+  "取材",
+  "点検",
+  "警備",
+  "物流",
+  "測量",
+  "農林水産業",
+  "資材管理",
+  "自然観測",
+  "事故・災害",
+  "趣味",
+  "研究開発",
+  "訓練",
+  "その他",
+] as const;
+
+const FLIGHT_METHOD_OPTIONS = [
+  "空港周辺",
+  "150m以上",
+  "人口集中地区（DID）",
+  "緊急用務空域",
+  "目視外飛行",
+  "夜間飛行",
+  "人または物件から30m未満",
+  "催し場所上空",
+  "危険物の輸送",
+  "物件投下",
+] as const;
+
+type RecordFormValues = z.infer<typeof schema>;
 
 function formatNumber(value: number | null | undefined, digits = 1) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "-";
   }
   return value.toFixed(digits);
+}
+
+function splitStoredValues(value: string) {
+  return value
+    .split(/[、,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parsePurpose(value: string) {
+  const selected = new Set<string>();
+  const otherValues: string[] = [];
+  for (const item of splitStoredValues(value)) {
+    if (PURPOSE_OPTIONS.includes(item as (typeof PURPOSE_OPTIONS)[number])) {
+      selected.add(item);
+      continue;
+    }
+    if (item.startsWith("その他:")) {
+      selected.add("その他");
+      const otherValue = item.slice("その他:".length).trim();
+      if (otherValue) {
+        otherValues.push(otherValue);
+      }
+      continue;
+    }
+    otherValues.push(item);
+  }
+  if (otherValues.length) {
+    selected.add("その他");
+  }
+  return { purpose: Array.from(selected), purpose_other: otherValues.join("、") };
+}
+
+function parseFlightMethods(value: string) {
+  return splitStoredValues(value).filter((item) => (
+    FLIGHT_METHOD_OPTIONS.includes(item as (typeof FLIGHT_METHOD_OPTIONS)[number])
+  ));
+}
+
+function toFlightRecordPayload(values: RecordFormValues) {
+  const { purpose_other, ...payload } = values;
+  const selectedPurposes = values.purpose.filter((item) => item !== "その他");
+  if (values.purpose.includes("その他")) {
+    selectedPurposes.push(`その他: ${purpose_other.trim()}`);
+  }
+  return {
+    ...payload,
+    purpose: selectedPurposes.join("、"),
+    special_flight_types: values.special_flight_types.join("、"),
+  };
 }
 
 function formatAltitudeMeters(value: number | null | undefined) {
@@ -401,11 +492,13 @@ export function RecordDetailPage() {
     setRecord(recordRes.data);
     setAircraft(aircraftRes.data.results);
     setPilots(pilotsRes.data.results);
+    const purpose = parsePurpose(recordRes.data.purpose);
     form.reset({
       aircraft: recordRes.data.aircraft,
       pilot: recordRes.data.pilot,
-      purpose: recordRes.data.purpose,
-      special_flight_types: recordRes.data.special_flight_types,
+      purpose: purpose.purpose,
+      purpose_other: purpose.purpose_other,
+      special_flight_types: parseFlightMethods(recordRes.data.special_flight_types),
       route_summary: recordRes.data.route_summary,
       official_weather: recordRes.data.official_weather || "晴れ",
       official_temperature_c: recordRes.data.official_temperature_c ?? 20,
@@ -419,10 +512,14 @@ export function RecordDetailPage() {
     void load();
   }, [recordId]);
 
-  async function save(values: z.infer<typeof schema>) {
+  async function persistForm(values: RecordFormValues) {
+    await api.put(`/flight-records/${recordId}/`, toFlightRecordPayload(values));
+  }
+
+  async function save(values: RecordFormValues) {
     setSaving(true);
     try {
-      await api.put(`/flight-records/${recordId}/`, values);
+      await persistForm(values);
       await load();
     } finally {
       setSaving(false);
@@ -432,6 +529,11 @@ export function RecordDetailPage() {
   async function finalizeRecord() {
     setBusyAction("finalize");
     try {
+      const isValid = await form.trigger();
+      if (!isValid) {
+        return;
+      }
+      await persistForm(form.getValues());
       await api.post(`/flight-records/${recordId}/finalize/`);
       await load();
     } finally {
@@ -442,6 +544,11 @@ export function RecordDetailPage() {
   async function generatePdf() {
     setBusyAction("pdf");
     try {
+      const isValid = await form.trigger();
+      if (!isValid) {
+        return;
+      }
+      await persistForm(form.getValues());
       await api.post(`/flight-records/${recordId}/generate-pdf/`);
       await load();
     } finally {
@@ -470,6 +577,7 @@ export function RecordDetailPage() {
     return <Panel title="読み込み中" eyebrow="Log" />;
   }
 
+  const selectedPurposes = form.watch("purpose") ?? [];
   const mapReady = record.takeoff_lat !== null && record.takeoff_lng !== null && record.landing_lat !== null && record.landing_lng !== null;
 
   return (
@@ -500,8 +608,37 @@ export function RecordDetailPage() {
                 {pilots.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
               </select>
             </div>
-            <div><label className="label">飛行目的</label><textarea className="input min-h-28" {...form.register("purpose")} /></div>
-            <div><label className="label">特定飛行の種類</label><textarea className="input min-h-24" {...form.register("special_flight_types")} /></div>
+            <fieldset>
+              <legend className="label">飛行の目的</legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {PURPOSE_OPTIONS.map((option) => (
+                  <label key={option} className="flex min-h-12 cursor-pointer items-center gap-3 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:border-sky-400">
+                    <input className="h-4 w-4 rounded border-slate-300 accent-sky-700" type="checkbox" value={option} {...form.register("purpose")} />
+                    <span>{option}</span>
+                  </label>
+                ))}
+              </div>
+              {selectedPurposes.includes("その他") ? (
+                <div className="mt-3">
+                  <label className="label">その他の内容</label>
+                  <input className="input" {...form.register("purpose_other")} />
+                  {form.formState.errors.purpose_other ? (
+                    <p className="mt-2 text-sm text-rose-600">{form.formState.errors.purpose_other.message}</p>
+                  ) : null}
+                </div>
+              ) : null}
+            </fieldset>
+            <fieldset>
+              <legend className="label">飛行方法</legend>
+              <div className="grid gap-2 sm:grid-cols-2">
+                {FLIGHT_METHOD_OPTIONS.map((option) => (
+                  <label key={option} className="flex min-h-12 cursor-pointer items-center gap-3 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-700 transition hover:border-sky-400">
+                    <input className="h-4 w-4 rounded border-slate-300 accent-sky-700" type="checkbox" value={option} {...form.register("special_flight_types")} />
+                    <span>{option}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
             <div><label className="label">飛行経路概要</label><textarea className="input min-h-24" {...form.register("route_summary")} /></div>
             <div className="grid gap-4 md:grid-cols-3">
               <div><label className="label">正式天気</label><input className="input" {...form.register("official_weather")} /></div>

@@ -937,7 +937,9 @@ def generate_pdf_asset(record: FlightRecord) -> GeneratedAsset:
         ["正式風速", "" if record.official_wind_speed_mps is None else f"{record.official_wind_speed_mps:.1f} m/s"],
         ["離陸場所", record.takeoff_address],
         ["着陸場所", record.landing_address],
-        ["飛行概要", record.purpose or ""],
+        ["飛行の目的", record.purpose or ""],
+        ["飛行方法", record.special_flight_types or ""],
+        ["飛行経路概要", record.route_summary or ""],
         ["記事", record.article_notes or ""],
     ]
     official_table = Table(official_rows, colWidths=[35 * mm, 145 * mm])
