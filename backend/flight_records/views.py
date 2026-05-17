@@ -24,7 +24,7 @@ from .serializers import (
     MavlinkConnectionSerializer,
     MavlinkLogImportSerializer,
 )
-from .services import finalize_flight_record, generate_pdf_asset
+from .services import finalize_flight_record, generate_pdf_asset, reverse_geocode
 from .tasks import dispatch_analysis_job
 
 
@@ -153,6 +153,16 @@ class FlightRecordViewSet(viewsets.ModelViewSet):
         if self.get_object().status == FlightRecord.Status.FINALIZED:
             raise ValidationError("確定済み飛行記録は編集できません。")
         serializer.save()
+
+    @action(detail=True, methods=["post"], url_path="refresh-addresses")
+    def refresh_addresses(self, request: Request, pk=None) -> Response:
+        record = self.get_object()
+        if record.takeoff_lat is not None and record.takeoff_lng is not None:
+            record.takeoff_address = reverse_geocode(record.takeoff_lat, record.takeoff_lng)
+        if record.landing_lat is not None and record.landing_lng is not None:
+            record.landing_address = reverse_geocode(record.landing_lat, record.landing_lng)
+        record.save(update_fields=["takeoff_address", "landing_address", "updated_at"])
+        return Response(self.get_serializer(record).data)
 
     @action(detail=True, methods=["post"])
     def finalize(self, request: Request, pk=None) -> Response:

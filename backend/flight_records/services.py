@@ -4,6 +4,7 @@ import io
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from django.db.models import F
 from django.utils import timezone as dj_timezone
 from pymavlink import DFReader
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
@@ -26,6 +27,8 @@ from reportlab.platypus import Flowable, Paragraph, SimpleDocTemplate, Spacer, T
 from .models import FlightAnalysis, FlightModeSpan, FlightRecord, FlightTimeLedger, GeneratedAsset
 
 logger = logging.getLogger(__name__)
+YAMASHIRO_SHINMEICHO_ADDRESS = "石川県加賀市山代温泉神明町付近"
+YAMASHIRO_SHINMEICHO_COORD = (36.28646816998257, 136.35569629956606)
 
 
 def _to_float(value: Any) -> float | None:
@@ -48,6 +51,144 @@ def _format_meters(value: Any) -> str:
     if rounded.is_integer():
         return f"{rounded:.0f}m"
     return f"{rounded:.1f}m"
+
+
+def _format_compact_decimal(value: float, digits: int) -> str:
+    return f"{value:.{digits}f}".rstrip("0").rstrip(".") or "0"
+
+
+def _format_duration_minutes(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    minutes = seconds / 60
+    return f"{_format_compact_decimal(minutes, 1 if minutes < 10 else 0)}分"
+
+
+def _format_duration_hours(seconds: int | None) -> str:
+    if seconds is None:
+        return ""
+    hours = seconds / 3600
+    return f"{_format_compact_decimal(hours, 2 if hours < 1 else 1)}時間"
+
+
+def _format_distance_m(value: float | None) -> str:
+    if value is None:
+        return ""
+    if value >= 1000:
+        return f"約{_format_compact_decimal(value / 1000, 1)}km"
+    return f"約{round(value):.0f}m"
+
+
+def _waypoint_distance_m(start: dict[str, Any], end: dict[str, Any]) -> float | None:
+    start_lat = _to_float(start.get("lat"))
+    start_lng = _to_float(start.get("lng"))
+    end_lat = _to_float(end.get("lat"))
+    end_lng = _to_float(end.get("lng"))
+    if start_lat is not None and start_lng is not None and end_lat is not None and end_lng is not None:
+        return _haversine_m(start_lat, start_lng, end_lat, end_lng)
+
+    start_x = _to_float(start.get("x_m"))
+    start_y = _to_float(start.get("y_m"))
+    end_x = _to_float(end.get("x_m"))
+    end_y = _to_float(end.get("y_m"))
+    if start_x is None or start_y is None or end_x is None or end_y is None:
+        return None
+    return math.hypot(end_x - start_x, end_y - start_y)
+
+
+def _compact_number_list(values: set[int]) -> str:
+    ordered = sorted(values)
+    if not ordered:
+        return ""
+    if len(ordered) >= 2 and ordered == list(range(ordered[0], ordered[-1] + 1)):
+        return f"{ordered[0]}〜{ordered[-1]}"
+    return "、".join(str(value) for value in ordered)
+
+
+def _summarize_analysis_messages(warning_messages: list[str], error_messages: list[str]) -> list[str]:
+    summaries: list[str] = []
+    seen: set[str] = set()
+    mission_waypoints: set[int] = set()
+    reached_commands: set[int] = set()
+    has_ekf_alignment = False
+    has_unknown_status = False
+
+    def add(summary: str) -> None:
+        if summary and summary not in seen:
+            seen.add(summary)
+            summaries.append(summary)
+
+    for raw_message in [*warning_messages, *error_messages]:
+        message = str(raw_message).strip()
+        if not message:
+            continue
+
+        if match := re.search(r"最低電圧が低めです:\s*min=([0-9.]+)V", message):
+            add(f"バッテリー最低電圧が{match.group(1)}Vまで低下しました。バッテリー状態を確認してください。")
+            continue
+        if match := re.search(r"GPS衛星数が少ない可能性があります:\s*min=(\d+)", message):
+            add(f"GPS衛星数が最小{match.group(1)}基まで低下しました。測位精度に注意してください。")
+            continue
+        if match := re.search(r"HDOPが悪化しています:\s*max=([0-9.]+)", message):
+            add(f"GPS測位精度の指標が最大{match.group(1)}まで悪化しました。位置情報の精度を確認してください。")
+            continue
+        if "離陸または着陸時刻の自動判定信頼度が低い" in message:
+            add("離陸または着陸時刻の自動判定に不確実性があります。必要に応じて手動確認してください。")
+            continue
+
+        if message == "Arming motors":
+            add("モーターがアームされ、飛行開始準備に入りました。")
+            continue
+        if match := re.search(r"ArduCopter\s+([^\s]+)", message):
+            add(f"機体ソフトウェアは ArduCopter {match.group(1)} です。")
+            continue
+        if re.fullmatch(r"[0-9a-fA-F]{16,}", message):
+            continue
+        if match := re.search(r"Param space used:\s*(\d+)/(\d+)", message):
+            add(f"パラメータ保存領域を {match.group(1)}/{match.group(2)} 使用しています。")
+            continue
+        if match := re.search(r"RC Protocol:\s*(.+)", message):
+            add(f"操縦入力は {match.group(1).strip()} 接続で記録されています。")
+            continue
+        if message == "New mission":
+            add("ミッション情報を読み込みました。")
+            continue
+        if message == "New rally":
+            add("ラリーポイント情報を読み込みました。")
+            continue
+        if message == "New fence":
+            add("ジオフェンス情報を読み込みました。")
+            continue
+        if match := re.search(r"Frame:\s*(.+)", message):
+            frame = match.group(1).strip()
+            frame_label = "クアッドコプター（PLUS構成）" if frame == "QUAD/PLUS" else frame
+            add(f"機体フレームは {frame_label} です。")
+            continue
+        if re.search(r"GPS\s*\d+:\s*probing", message):
+            add("GPS受信機の接続確認を行いました。")
+            continue
+        if "in-flight yaw alignment complete" in message:
+            has_ekf_alignment = True
+            continue
+        if match := re.search(r"Mission:\s*(\d+)\s+WP", message):
+            mission_waypoints.add(int(match.group(1)))
+            continue
+        if match := re.search(r"Reached command #(\d+)", message):
+            reached_commands.add(int(match.group(1)))
+            continue
+
+        has_unknown_status = True
+
+    if has_ekf_alignment:
+        add("方位センサーと姿勢推定の調整が完了しました。")
+    if mission_waypoints:
+        add(f"ウェイポイント{_compact_number_list(mission_waypoints)}の飛行指示が記録されています。")
+    if reached_commands:
+        add(f"ウェイポイント{_compact_number_list(reached_commands)}への到達が記録されています。")
+    if has_unknown_status:
+        add("その他の機体状態メッセージが記録されています。必要に応じて詳細ログを確認してください。")
+
+    return summaries
 
 
 class AltitudeProfile3DChart(Flowable):
@@ -84,6 +225,8 @@ class AltitudeProfile3DChart(Flowable):
                     "seq": item.get("seq"),
                     "x_m": x_m,
                     "y_m": y_m,
+                    "lat": item.get("lat"),
+                    "lng": item.get("lng"),
                     "relative_altitude_m": max(relative_altitude_m, 0.0),
                     "altitude_m": item.get("altitude_m"),
                 }
@@ -163,7 +306,7 @@ class AltitudeProfile3DChart(Flowable):
         canvas.drawString(8 * mm, self.height - 10 * mm, "3D高度プロファイル")
         canvas.setFont("HeiseiKakuGo-W5", 7.5)
         canvas.setFillColor(colors.HexColor("#587084"))
-        canvas.drawString(8 * mm, self.height - 15 * mm, "Z=高度 / X・Y=水平位置 / 橙=waypoint")
+        canvas.drawString(8 * mm, self.height - 15 * mm, "Z=高度 / X・Y=水平位置 / 橙=waypoint / WP間=概算距離")
 
         if not self.has_data:
             canvas.setFont("HeiseiKakuGo-W5", 9)
@@ -257,6 +400,22 @@ class AltitudeProfile3DChart(Flowable):
         waypoint_ground_points = [projected(point, ground=True) for point in self.waypoints]
         draw_line(waypoint_points, colors.HexColor("#f97316"), 1.0)
 
+        canvas.setFont("HeiseiKakuGo-W5", 6.8)
+        for index in range(len(self.waypoints) - 1):
+            distance_label = _format_distance_m(_waypoint_distance_m(self.waypoints[index], self.waypoints[index + 1]))
+            if not distance_label:
+                continue
+            start_x, start_y = waypoint_points[index]
+            end_x, end_y = waypoint_points[index + 1]
+            label_width = canvas.stringWidth(distance_label, "HeiseiKakuGo-W5", 6.8) + 4 * mm
+            label_x = min(max((start_x + end_x) / 2 - label_width / 2, 2 * mm), self.width - label_width - 2 * mm)
+            label_y = min(max((start_y + end_y) / 2 + 1.8 * mm, 2 * mm), self.height - 8 * mm)
+            canvas.setFillColor(colors.white)
+            canvas.setStrokeColor(colors.HexColor("#99f6e4"))
+            canvas.roundRect(label_x, label_y - 1.4 * mm, label_width, 4.8 * mm, 2, fill=1, stroke=1)
+            canvas.setFillColor(colors.HexColor("#0f766e"))
+            canvas.drawString(label_x + 2 * mm, label_y, distance_label)
+
         canvas.setFont("HeiseiKakuGo-W5", 7.2)
         for index, waypoint in enumerate(self.waypoints):
             x, y = waypoint_points[index]
@@ -343,17 +502,33 @@ def append_fukin(address: str) -> str:
     return f"{cleaned}付近"
 
 
+def _is_near_yamashiro_shinmeicho(lat: float | None, lng: float | None) -> bool:
+    if lat is None or lng is None:
+        return False
+    return _haversine_m(lat, lng, YAMASHIRO_SHINMEICHO_COORD[0], YAMASHIRO_SHINMEICHO_COORD[1]) <= 700
+
+
 def fallback_address(lat: float | None, lng: float | None) -> str:
     if lat is None or lng is None:
         return "住所取得不可"
+    if _is_near_yamashiro_shinmeicho(lat, lng):
+        return YAMASHIRO_SHINMEICHO_ADDRESS
     return append_fukin(f"緯度 {lat:.6f}, 経度 {lng:.6f}")
+
+
+def display_address(address: str, lat: float | None, lng: float | None) -> str:
+    if _is_near_yamashiro_shinmeicho(lat, lng):
+        return YAMASHIRO_SHINMEICHO_ADDRESS
+    return address or fallback_address(lat, lng)
 
 
 def reverse_geocode(lat: float | None, lng: float | None) -> str:
     if lat is None or lng is None:
         return "住所取得不可"
+    if _is_near_yamashiro_shinmeicho(lat, lng):
+        return YAMASHIRO_SHINMEICHO_ADDRESS
 
-    base_url = os.getenv("REVERSE_GEOCODE_URL", "").strip()
+    base_url = (os.getenv("REVERSE_GEOCODE_URL", "").strip() or "https://nominatim.openstreetmap.org/reverse")
     if not base_url:
         return fallback_address(lat, lng)
 
@@ -863,6 +1038,8 @@ def _aircraft_snapshot(record: FlightRecord) -> dict[str, Any]:
         return {}
     return {
         "registration_number": aircraft.registration_number,
+        "is_certified": aircraft.is_certified,
+        "remote_id": aircraft.remote_id,
         "model": aircraft.model,
         "serial_number": aircraft.serial_number,
         "name": aircraft.name,
@@ -903,7 +1080,14 @@ def generate_pdf_asset(record: FlightRecord) -> GeneratedAsset:
     styles.add(ParagraphStyle(name="JapaneseTitle", fontName="HeiseiKakuGo-W5", fontSize=16, leading=20))
 
     buffer = io.BytesIO()
-    document = SimpleDocTemplate(buffer, pagesize=A4, topMargin=18 * mm, bottomMargin=18 * mm)
+    document = SimpleDocTemplate(
+        buffer,
+        pagesize=landscape(A4),
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
     story = [
         Paragraph("ArduPilot Flight Record", styles["JapaneseTitle"]),
         Spacer(1, 6 * mm),
@@ -911,14 +1095,19 @@ def generate_pdf_asset(record: FlightRecord) -> GeneratedAsset:
 
     summary_rows = [
         ["記録ID", str(record.pk)],
-        ["状態", record.get_status_display()],
+        ["無人航空機のリモートID", record.aircraft.remote_id if record.aircraft else ""],
+        ["機体登録番号", record.aircraft.registration_number if record.aircraft else ""],
+        ["機体情報", "" if record.aircraft is None else f"{record.aircraft.name} / {record.aircraft.model} / {record.aircraft.serial_number}"],
+        ["アプリ内状態", record.get_status_display()],
         ["飛行日", record.flight_date.isoformat() if record.flight_date else ""],
+        ["飛行させた者の氏名", record.pilot.name if record.pilot else ""],
         ["離陸時刻", record.takeoff_at_utc.astimezone(dj_timezone.get_current_timezone()).strftime("%Y-%m-%d %H:%M:%S") if record.takeoff_at_utc else ""],
         ["着陸時刻", record.landing_at_utc.astimezone(dj_timezone.get_current_timezone()).strftime("%Y-%m-%d %H:%M:%S") if record.landing_at_utc else ""],
-        ["飛行時間(秒)", str(record.duration_seconds or 0)],
-        ["総合判定", record.diagnostic_grade],
+        ["飛行時間(分)", _format_duration_minutes(record.duration_seconds)],
+        ["総飛行時間(時間)", _format_duration_hours(record.aircraft.current_total_flight_seconds if record.aircraft else record.duration_seconds)],
+        ["ログ解析判定", record.diagnostic_grade],
     ]
-    summary_table = Table(summary_rows, colWidths=[35 * mm, 145 * mm])
+    summary_table = Table(summary_rows, colWidths=[45 * mm, 220 * mm])
     summary_table.setStyle(
         TableStyle(
             [
@@ -935,14 +1124,16 @@ def generate_pdf_asset(record: FlightRecord) -> GeneratedAsset:
         ["正式気象", record.official_weather],
         ["正式気温", "" if record.official_temperature_c is None else f"{record.official_temperature_c:.1f} ℃"],
         ["正式風速", "" if record.official_wind_speed_mps is None else f"{record.official_wind_speed_mps:.1f} m/s"],
-        ["離陸場所", record.takeoff_address],
-        ["着陸場所", record.landing_address],
+        ["離陸場所", display_address(record.takeoff_address, record.takeoff_lat, record.takeoff_lng)],
+        ["着陸場所", display_address(record.landing_address, record.landing_lat, record.landing_lng)],
         ["飛行の目的", record.purpose or ""],
         ["飛行方法", record.special_flight_types or ""],
         ["飛行経路概要", record.route_summary or ""],
+        ["飛行させた者の署名", record.pilot_signature or ""],
+        ["飛行の安全に影響のあった事項", record.safety_notes or ""],
         ["記事", record.article_notes or ""],
     ]
-    official_table = Table(official_rows, colWidths=[35 * mm, 145 * mm])
+    official_table = Table(official_rows, colWidths=[45 * mm, 220 * mm])
     official_table.setStyle(
         TableStyle(
             [
@@ -979,10 +1170,13 @@ def generate_pdf_asset(record: FlightRecord) -> GeneratedAsset:
     analysis = record.analysis if hasattr(record, "analysis") else None
     if analysis is not None:
         story.extend([Spacer(1, 6 * mm), Paragraph("解析サマリ", styles["JapaneseTitle"])])
-        for message in analysis.warning_messages:
-            story.append(Paragraph(f"・{message}", styles["Japanese"]))
-        for message in analysis.error_messages:
-            story.append(Paragraph(f"・{message}", styles["Japanese"]))
+        summary_messages = _summarize_analysis_messages(analysis.warning_messages, analysis.error_messages)
+        if summary_messages:
+            for message in summary_messages:
+                story.append(Paragraph(f"・{message}", styles["Japanese"]))
+        else:
+            story.append(Paragraph("・特筆すべき機体メッセージはありません。", styles["Japanese"]))
+        story.append(Paragraph("※MissionPlannerのメッセージから抽出", styles["Japanese"]))
 
         summary_json = analysis.summary_json or {}
         altitude_chart = AltitudeProfile3DChart(

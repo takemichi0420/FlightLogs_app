@@ -23,6 +23,7 @@ const schema = z.object({
   official_wind_speed_mps: z.coerce.number(),
   safety_notes: z.string().default(""),
   article_notes: z.string().default(""),
+  pilot_signature: z.string().default(""),
 }).superRefine((values, context) => {
   if (values.purpose.includes("その他") && !values.purpose_other.trim()) {
     context.addIssue({
@@ -64,12 +65,97 @@ const FLIGHT_METHOD_OPTIONS = [
 ] as const;
 
 type RecordFormValues = z.infer<typeof schema>;
+const YAMASHIRO_SHINMEICHO_ADDRESS = "石川県加賀市山代温泉神明町付近";
+const YAMASHIRO_SHINMEICHO_COORD = { lat: 36.28646816998257, lng: 136.35569629956606 };
+const recordItemClass = "grid gap-1 rounded-2xl border border-slate-200 bg-white/70 px-4 py-3 md:grid-cols-[13rem_1fr] md:items-start";
+const recordLabelClass = "font-semibold text-slate-500";
+const recordValueClass = "text-slate-800";
 
 function formatNumber(value: number | null | undefined, digits = 1) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "-";
   }
   return value.toFixed(digits);
+}
+
+function formatDate(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  return new Date(`${value}T00:00:00`).toLocaleDateString("ja-JP");
+}
+
+function formatDateTime(value: string | null | undefined) {
+  if (!value) {
+    return "-";
+  }
+  return new Date(value).toLocaleString("ja-JP");
+}
+
+function formatCompactNumber(value: number, digits: number) {
+  return value.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+}
+
+function formatDurationMinutes(value: number | null | undefined) {
+  if (value === null || value === undefined) {
+    return "-";
+  }
+  const minutes = value / 60;
+  return `${formatCompactNumber(minutes, minutes < 10 ? 1 : 0)}分`;
+}
+
+function formatDurationHours(value: number | null | undefined) {
+  if (value === null || value === undefined) {
+    return "-";
+  }
+  const hours = value / 3600;
+  return `${formatCompactNumber(hours, hours < 1 ? 2 : 1)}時間`;
+}
+
+function formatCoordinate(lat: number | null | undefined, lng: number | null | undefined) {
+  if (lat === null || lat === undefined || lng === null || lng === undefined) {
+    return "";
+  }
+  return `緯度 ${lat.toFixed(6)}, 経度 ${lng.toFixed(6)}`;
+}
+
+function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number) {
+  const radius = 6371000;
+  const phi1 = lat1 * Math.PI / 180;
+  const phi2 = lat2 * Math.PI / 180;
+  const dphi = (lat2 - lat1) * Math.PI / 180;
+  const dlambda = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dphi / 2) ** 2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda / 2) ** 2;
+  return 2 * radius * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function isNearYamashiroShinmeicho(lat: number | null | undefined, lng: number | null | undefined) {
+  if (lat === null || lat === undefined || lng === null || lng === undefined) {
+    return false;
+  }
+  return distanceMeters(lat, lng, YAMASHIRO_SHINMEICHO_COORD.lat, YAMASHIRO_SHINMEICHO_COORD.lng) <= 700;
+}
+
+function formatPlace(address: string, lat: number | null | undefined, lng: number | null | undefined) {
+  const coordinate = formatCoordinate(lat, lng);
+  if (isNearYamashiroShinmeicho(lat, lng)) {
+    return YAMASHIRO_SHINMEICHO_ADDRESS;
+  }
+  if (!address && !coordinate) {
+    return "-";
+  }
+  if (!address) {
+    return coordinate;
+  }
+  return address;
+}
+
+function needsAddressRefresh(record: FlightRecord) {
+  const isFallback = (address: string) => !address || address.startsWith("緯度 ");
+  return (
+    (record.takeoff_lat !== null && record.takeoff_lng !== null && isFallback(record.takeoff_address)) ||
+    (record.landing_lat !== null && record.landing_lng !== null && isFallback(record.landing_address))
+  );
 }
 
 function splitStoredValues(value: string) {
@@ -128,6 +214,28 @@ function formatAltitudeMeters(value: number | null | undefined) {
   }
   const rounded = Math.round(value * 10) / 10;
   return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}m`;
+}
+
+function formatDistanceMeters(value: number | null | undefined) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "-";
+  }
+  if (value >= 1000) {
+    return `${formatCompactNumber(value / 1000, 1)}km`;
+  }
+  return `${Math.round(value)}m`;
+}
+
+function waypointDistanceMeters(start: WaypointPoint, end: WaypointPoint) {
+  if (
+    Number.isFinite(start.lat) &&
+    Number.isFinite(start.lng) &&
+    Number.isFinite(end.lat) &&
+    Number.isFinite(end.lng)
+  ) {
+    return distanceMeters(start.lat, start.lng, end.lat, end.lng);
+  }
+  return Math.hypot(end.x_m - start.x_m, end.y_m - start.y_m);
 }
 
 function addCylinderBetween(scene: THREE.Scene | THREE.Group, start: THREE.Vector3, end: THREE.Vector3, material: THREE.Material, radius = 0.045) {
@@ -401,6 +509,13 @@ function AltitudeProfile3D({ profile, waypoints }: AltitudeProfile3DProps) {
       const waypointLineMaterial = new THREE.LineBasicMaterial({ color: 0xf97316, transparent: true, opacity: 0.72 });
       const waypointStemMaterial = new THREE.MeshBasicMaterial({ color: 0xf97316, transparent: true, opacity: 0.42 });
       addLine(group, waypointPoints, waypointLineMaterial);
+      for (let index = 0; index < waypointPoints.length - 1; index += 1) {
+        const midpoint = new THREE.Vector3().addVectors(waypointPoints[index], waypointPoints[index + 1]).multiplyScalar(0.5);
+        const distance = waypointDistanceMeters(plotWaypoints[index], plotWaypoints[index + 1]);
+        const label = createLabelSprite(`約${formatDistanceMeters(distance)}`, "#0f766e", 320, 0.82);
+        label.position.set(midpoint.x, midpoint.y + 0.22 + (index % 2) * 0.14, midpoint.z);
+        group.add(label);
+      }
       waypointPoints.forEach((position, index) => {
         const waypoint = plotWaypoints[index];
         const marker = new THREE.Mesh(new THREE.SphereGeometry(0.14, 18, 18), waypointMaterial);
@@ -466,7 +581,7 @@ function AltitudeProfile3D({ profile, waypoints }: AltitudeProfile3DProps) {
     <div className="relative h-full min-h-72 overflow-hidden rounded-2xl border border-slate-200 bg-slate-50" ref={containerRef}>
       <canvas className="block h-full w-full" ref={canvasRef} />
       <div className="pointer-events-none absolute left-4 top-4 rounded-xl border border-slate-200 bg-white/85 px-3 py-2 text-xs font-semibold text-slate-600 shadow-sm">
-        3D高度 / waypoint
+        3D高度 / waypoint / WP間距離
       </div>
     </div>
   );
@@ -489,22 +604,32 @@ export function RecordDetailPage() {
       api.get("/aircraft/"),
       api.get("/pilots/"),
     ]);
-    setRecord(recordRes.data);
+    let recordData = recordRes.data;
+    if (needsAddressRefresh(recordData)) {
+      try {
+        const refreshed = await api.post<FlightRecord>(`/flight-records/${recordId}/refresh-addresses/`);
+        recordData = refreshed.data;
+      } catch {
+        recordData = recordRes.data;
+      }
+    }
+    setRecord(recordData);
     setAircraft(aircraftRes.data.results);
     setPilots(pilotsRes.data.results);
-    const purpose = parsePurpose(recordRes.data.purpose);
+    const purpose = parsePurpose(recordData.purpose);
     form.reset({
-      aircraft: recordRes.data.aircraft,
-      pilot: recordRes.data.pilot,
+      aircraft: recordData.aircraft,
+      pilot: recordData.pilot,
       purpose: purpose.purpose,
       purpose_other: purpose.purpose_other,
-      special_flight_types: parseFlightMethods(recordRes.data.special_flight_types),
-      route_summary: recordRes.data.route_summary,
-      official_weather: recordRes.data.official_weather || "晴れ",
-      official_temperature_c: recordRes.data.official_temperature_c ?? 20,
-      official_wind_speed_mps: recordRes.data.official_wind_speed_mps ?? 1,
-      safety_notes: recordRes.data.safety_notes,
-      article_notes: recordRes.data.article_notes,
+      special_flight_types: parseFlightMethods(recordData.special_flight_types),
+      route_summary: recordData.route_summary,
+      official_weather: recordData.official_weather || "晴れ",
+      official_temperature_c: recordData.official_temperature_c ?? 20,
+      official_wind_speed_mps: recordData.official_wind_speed_mps ?? 1,
+      safety_notes: recordData.safety_notes,
+      article_notes: recordData.article_notes,
+      pilot_signature: recordData.pilot_signature,
     });
   }
 
@@ -578,6 +703,24 @@ export function RecordDetailPage() {
   }
 
   const selectedPurposes = form.watch("purpose") ?? [];
+  const selectedAircraftId = form.watch("aircraft");
+  const selectedPilotId = form.watch("pilot");
+  const selectedAircraft = aircraft.find((item) => item.id === Number(selectedAircraftId)) ?? null;
+  const selectedPilot = pilots.find((item) => item.id === Number(selectedPilotId)) ?? null;
+  const remoteIdDisplay = selectedAircraft?.remote_id || "";
+  const aircraftRegistrationNumber = selectedAircraft?.registration_number || "";
+  const selectedFlightMethods = form.watch("special_flight_types") ?? [];
+  const purposeOther = form.watch("purpose_other")?.trim();
+  const purposeDisplay = [
+    ...selectedPurposes.filter((item) => item !== "その他"),
+    ...(selectedPurposes.includes("その他") && purposeOther ? [`その他: ${purposeOther}`] : []),
+  ].join("、") || "-";
+  const flightMethodsDisplay = selectedFlightMethods.join("、") || "-";
+  const routeSummary = form.watch("route_summary") || "-";
+  const safetyNotes = form.watch("safety_notes") || "-";
+  const articleNotes = form.watch("article_notes") || "-";
+  const pilotSignature = form.watch("pilot_signature") || "-";
+  const totalFlightSeconds = selectedAircraft?.current_total_flight_seconds ?? record.duration_seconds ?? 0;
   const mapReady = record.takeoff_lat !== null && record.takeoff_lng !== null && record.landing_lat !== null && record.landing_lng !== null;
 
   return (
@@ -646,6 +789,7 @@ export function RecordDetailPage() {
               <div><label className="label">正式風速 m/s</label><input className="input" type="number" step="0.1" {...form.register("official_wind_speed_mps")} /></div>
             </div>
             <div><label className="label">安全確認事項</label><textarea className="input min-h-24" {...form.register("safety_notes")} /></div>
+            <div><label className="label">飛行させた者の署名</label><input className="input" {...form.register("pilot_signature")} /></div>
             <div><label className="label">備考</label><textarea className="input min-h-24" {...form.register("article_notes")} /></div>
             <div className="flex flex-wrap gap-3">
               <button className="btn-primary" disabled={saving} type="submit">{saving ? "保存中..." : "下書き保存"}</button>
@@ -665,11 +809,38 @@ export function RecordDetailPage() {
 
           <div className="space-y-4">
             <div className="panel-muted p-4">
+              <p className="text-sm font-semibold text-slate-500">記録項目</p>
+              <p className="mt-1 text-lg font-bold text-ink">飛行記録 ①〜⑬</p>
+              <div className="mt-4 grid gap-3 text-sm">
+                <div className={recordItemClass}><p className={recordLabelClass}>① 無人航空機のリモートID</p><p className={recordValueClass}>{remoteIdDisplay}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>機体登録番号</p><p className={recordValueClass}>{aircraftRegistrationNumber}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>② 年月日</p><p className={recordValueClass}>{formatDate(record.flight_date)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>③ 飛行させた者の氏名</p><p className={recordValueClass}>{selectedPilot ? `${selectedPilot.name}${selectedPilot.license_number ? ` / ${selectedPilot.license_number}` : ""}` : "-"}</p></div>
+                <div className={recordItemClass}>
+                  <p className={recordLabelClass}>④ 飛行概要</p>
+                  <div className={`${recordValueClass} space-y-1`}>
+                    <p>目的: {purposeDisplay}</p>
+                    <p>飛行方法: {flightMethodsDisplay}</p>
+                    <p>経路概要: {routeSummary}</p>
+                  </div>
+                </div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑤ 離陸場所</p><p className={recordValueClass}>{formatPlace(record.takeoff_address, record.takeoff_lat, record.takeoff_lng)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑥ 着陸場所</p><p className={recordValueClass}>{formatPlace(record.landing_address, record.landing_lat, record.landing_lng)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑦ 離陸時刻</p><p className={recordValueClass}>{formatDateTime(record.takeoff_at_utc)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑧ 着陸時刻</p><p className={recordValueClass}>{formatDateTime(record.landing_at_utc)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑨ 飛行時間</p><p className={recordValueClass}>{formatDurationMinutes(record.duration_seconds)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑩ 総飛行時間</p><p className={recordValueClass}>{formatDurationHours(totalFlightSeconds)}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑪ 飛行させた者の署名</p><p className={recordValueClass}>{pilotSignature}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑫ 飛行の安全に影響のあった事項</p><p className={recordValueClass}>{safetyNotes}</p></div>
+                <div className={recordItemClass}><p className={recordLabelClass}>⑬ 記事</p><p className={recordValueClass}>{articleNotes}</p></div>
+              </div>
+            </div>
+            <div className="panel-muted p-4">
               <p className="text-sm font-semibold text-slate-500">解析情報</p>
               <div className="mt-3 space-y-2 text-sm text-slate-700">
-                <p>離陸場所: {record.takeoff_address || "解析待ち"}</p>
-                <p>着陸場所: {record.landing_address || "解析待ち"}</p>
-                <p>飛行時間: {record.duration_seconds ?? 0} 秒</p>
+                <p>離陸場所: {formatPlace(record.takeoff_address, record.takeoff_lat, record.takeoff_lng)}</p>
+                <p>着陸場所: {formatPlace(record.landing_address, record.landing_lat, record.landing_lng)}</p>
+                <p>飛行時間: {formatDurationMinutes(record.duration_seconds)}</p>
                 <p>参考気象: {record.reference_weather || "参考値なし"}</p>
               </div>
             </div>

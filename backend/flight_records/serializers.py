@@ -97,6 +97,7 @@ class FlightRecordSerializer(serializers.ModelSerializer):
             "reference_source",
             "safety_notes",
             "article_notes",
+            "pilot_signature",
             "diagnostic_grade",
             "review_required",
             "analysis_error",

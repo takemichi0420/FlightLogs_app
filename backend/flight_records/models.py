@@ -52,6 +52,7 @@ class FlightRecord(models.Model):
     reference_source = models.CharField(max_length=255, blank=True)
     safety_notes = models.TextField(blank=True)
     article_notes = models.TextField(blank=True)
+    pilot_signature = models.CharField(max_length=255, blank=True)
     diagnostic_grade = models.CharField(max_length=16, choices=DiagnosticGrade.choices, blank=True)
     review_required = models.BooleanField(default=False)
     analysis_error = models.TextField(blank=True)

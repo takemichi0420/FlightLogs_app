@@ -16,6 +16,8 @@ export type Paginated<T> = {
 export type Aircraft = {
   id: number;
   registration_number: string;
+  is_certified: boolean;
+  remote_id: string;
   model: string;
   serial_number: string;
   name: string;
@@ -137,6 +139,7 @@ export type FlightRecord = {
   reference_source: string;
   safety_notes: string;
   article_notes: string;
+  pilot_signature: string;
   diagnostic_grade: string;
   review_required: boolean;
   finalized_at: string | null;
